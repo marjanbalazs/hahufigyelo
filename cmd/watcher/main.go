@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type DetailOrder int
@@ -27,6 +30,7 @@ const (
 )
 
 type Car struct {
+	id         int
 	name       string
 	price      int
 	engine     string
@@ -36,6 +40,43 @@ type Car struct {
 	powerKW    int
 	powerHP    int
 	kilometers int
+}
+
+type DB struct {
+	db *sql.DB
+}
+
+func (db *DB) insertCar(car *Car) {
+	stmt, err := db.db.Prepare(`INSERT INTO cars VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		log.Fatal("Preparing INSERT statement failed")
+	}
+	_, err = stmt.Exec(car.id, car.name, car.price, car.engine, car.year, car.month, car.enginesize, car.powerKW, car.powerHP, car.kilometers)
+	if err != nil {
+		log.Fatal("Failed to INSERT")
+	}
+}
+
+func (db *DB) createCarTable() {
+	stmt, err := db.db.Prepare(`CREATE TABLE IF NOT EXISTS cars(
+		id INTEGER PRIMARY KEY,
+		name TEXT,
+		price INTEGER,
+		engine TEXT,
+		year INTEGER,
+		month INTEGER,
+		enginesize INTEGER,
+		powerKW INTEGER,
+		powerHP INTEGER,
+		kilometers INTEGER)
+		`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, execErr := stmt.Exec()
+	if execErr != nil {
+		log.Fatal(err)
+	}
 }
 
 var findDigit = regexp.MustCompile(`[\d]+`)
@@ -55,82 +96,12 @@ func extractNumberFromString(str string) (int, error) {
 	return parsed, err
 }
 
-func parseItemList(doc *goquery.Document) {
-	doc.Find(".list-view").Each(func(i int, selection *goquery.Selection) {
-		selection.Find(".talalati-sor").Each(func(i int, selection *goquery.Selection) {
-			title := selection.Find("H3").Text()
-			price := selection.Find(".vetelar").Last().Text()
-			infos := selection.Find(".talalatisor-info").Filter(".adatok")
-			var infoStrings []string
-			infos.Each(func(i int, s *goquery.Selection) {
-				stuff := s.Find("SPAN").Text()
-				infoStrings = append(infoStrings, stuff)
-			})
-			var car Car
-			car.name = title
-			value, err := extractNumberFromString(price)
-			if err != nil {
-				fmt.Println("Couldn't parse price")
-			}
-			car.price = value
-			for idx, str := range infoStrings {
-				trimmed := strings.TrimSpace(str)
-				switch DetailOrder(idx) {
-				case Engine:
-					car.engine = trimmed
-				case Year:
-					dates := strings.Split(trimmed, "/")
-					year, err := strconv.Atoi(dates[0])
-					if err != nil {
-						fmt.Println("Couldn't parse made year")
-					}
-					car.year = year
-					if len(dates) == 2 {
-						month, err := strconv.Atoi(dates[1])
-						if err != nil {
-							fmt.Println("Couldn't parse made month")
-						}
-						car.year = month
-					}
-				case Enginesize:
-					value, err := extractNumberFromString(trimmed)
-					if err != nil {
-						fmt.Println("Couldn't parse enginesize")
-					}
-					car.enginesize = value
-				case PowerHP:
-					value, err := extractNumberFromString(trimmed)
-					if err != nil {
-						fmt.Println("Couldn't parse powerHP")
-					}
-					car.powerHP = value
-				case PowerKW:
-					value, err := extractNumberFromString(trimmed)
-					if err != nil {
-						fmt.Println("Couldn't parse powerKW")
-					}
-					car.powerKW = value
-				case Kilometers:
-					value, err := extractNumberFromString(trimmed)
-					if err != nil {
-						fmt.Println("Couldn't parse kilometers")
-					}
-					car.kilometers = value
-				}
-			}
-			fmt.Println(title)
-			fmt.Println(price, infoStrings)
-		})
-	})
-}
-
-func refreshList(url string, jobSubmitter chan<- string) {
-	htmlBody := getSite(url)
-	doc, err := goquery.NewDocumentFromReader(htmlBody)
+func refreshList(url string, site io.ReadCloser, jobSubmitter chan<- string) {
+	doc, err := goquery.NewDocumentFromReader(site)
 	if err != nil {
 		log.Fatal(err)
 	}
-	htmlBody.Close()
+	site.Close()
 	paginationItem := doc.Find(".pagination")
 	numberOfPages := func() int {
 		if len(paginationItem.Nodes) == 0 {
@@ -153,37 +124,119 @@ func refreshList(url string, jobSubmitter chan<- string) {
 	}
 }
 
-func processSite(htmlBody io.ReadCloser) {
+func processSite(htmlBody io.ReadCloser, db *DB) {
 	doc, err := goquery.NewDocumentFromReader(htmlBody)
 	if err != nil {
 		log.Fatal(err)
 	}
 	htmlBody.Close()
-	parseItemList(doc)
+	doc.Find(".list-view").Each(func(i int, selection *goquery.Selection) {
+		selection.Find(".talalati-sor").Each(func(i int, selection *goquery.Selection) {
+			var car Car
+			idText := selection.Find(".talalatisor-hirkod").Text()
+			id, err := extractNumberFromString(idText)
+			if err != nil {
+				log.Fatal("Could not parse ID")
+				return
+			}
+			car.id = id
+
+			title := selection.Find("H3").Text()
+			car.name = title
+
+			price := selection.Find(".vetelar").Last().Text()
+			value, err := extractNumberFromString(price)
+			if err != nil {
+				fmt.Println("Couldn't parse price")
+				return
+			}
+			car.price = value
+
+			infos := selection.Find(".talalatisor-info").Filter(".adatok")
+			var infoStrings []string
+			infos.Each(func(i int, s *goquery.Selection) {
+				stuff := s.Find("SPAN").Text()
+				infoStrings = append(infoStrings, stuff)
+			})
+
+			for idx, str := range infoStrings {
+				trimmed := strings.TrimSpace(str)
+				switch DetailOrder(idx) {
+				case Engine:
+					car.engine = trimmed
+				case Year:
+					dates := strings.Split(trimmed, "/")
+					year, err := strconv.Atoi(dates[0])
+					if err != nil {
+						fmt.Println("Couldn't parse made year")
+					}
+					car.year = year
+					if len(dates) == 2 {
+						month, err := strconv.Atoi(dates[1])
+						if err != nil {
+							fmt.Println("Couldn't parse made month")
+						}
+						car.month = month
+					}
+				case Enginesize:
+					enginesize, err := extractNumberFromString(trimmed)
+					if err != nil {
+						fmt.Println("Couldn't parse enginesize")
+					}
+					car.enginesize = enginesize
+				case PowerHP:
+					powerHP, err := extractNumberFromString(trimmed)
+					if err != nil {
+						fmt.Println("Couldn't parse powerHP")
+					}
+					car.powerHP = powerHP
+				case PowerKW:
+					powerKW, err := extractNumberFromString(trimmed)
+					if err != nil {
+						fmt.Println("Couldn't parse powerKW")
+					}
+					car.powerKW = powerKW
+				case Kilometers:
+					kilometers, err := extractNumberFromString(trimmed)
+					if err != nil {
+						fmt.Println("Couldn't parse kilometers")
+					}
+					car.kilometers = kilometers
+				}
+			}
+			db.insertCar(&car)
+		})
+	})
 }
 
-func worker(jobs <-chan string) {
+func worker(jobs <-chan string, db *DB) {
+	rateLimiter := time.Tick(time.Millisecond * 200)
 	for {
 		select {
 		case job := <-jobs:
-			processSite(getSite(job))
+			<-rateLimiter
+			fmt.Println(job)
+			site := getSite(job)
+			processSite(site, db)
 		}
 	}
 }
 
-func startScraping(period uint, url string) chan string {
+func startScraping(period uint, url string, db *DB) chan string {
 	stop := make(chan string)
 	jobs := make(chan string)
 	intervalTicker := time.NewTicker(time.Minute * time.Duration(period))
 
-	go worker(jobs)
-	refreshList(url, jobs)
+	go worker(jobs, db)
+	site := getSite(url)
+	refreshList(url, site, jobs)
 
 	go func() {
 		for {
 			select {
 			case <-intervalTicker.C:
-				refreshList(url, jobs)
+				site := getSite(url)
+				refreshList(url, site, jobs)
 			case stop := <-stop:
 				fmt.Println("Stop" + stop)
 				return
@@ -194,11 +247,47 @@ func startScraping(period uint, url string) chan string {
 	return stop
 }
 
+func dumpTable(rows *sql.Rows, out io.Writer) error {
+	colNames, err := rows.Columns()
+	if err != nil {
+		panic(err)
+	}
+	writer := csv.NewWriter(out)
+	writer.Comma = '\t'
+	readCols := make([]interface{}, len(colNames))
+	writeCols := make([]string, len(colNames))
+	for i, _ := range writeCols {
+		readCols[i] = &writeCols[i]
+	}
+	for rows.Next() {
+		err := rows.Scan(readCols...)
+		if err != nil {
+			panic(err)
+		}
+		writer.Write(writeCols)
+	}
+	if err = rows.Err(); err != nil {
+		panic(err)
+	}
+	writer.Flush()
+	return nil
+}
+
 func main() {
 	var timervalue int = 0
 	var url string = ""
 	var worker chan string
 	reader := bufio.NewReader(os.Stdin)
+
+	//Crate the Database, I'm going for in memory here
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	dbContext := &DB{db: db}
+	dbContext.createCarTable()
+
 	fmt.Println("Site watcher")
 	fmt.Println("---------------------")
 	fmt.Println("Add a time interval and a url to watch")
@@ -209,8 +298,8 @@ func main() {
 		cmd := strings.Fields(text)
 		if len(cmd) > 0 {
 			switch cmd[0] {
-			case "run":
-				worker = startScraping(uint(timervalue), url)
+			case "start":
+				worker = startScraping(uint(timervalue), url, dbContext)
 			case "interval":
 				value, err := strconv.Atoi(cmd[1])
 				if err != nil {
@@ -219,6 +308,13 @@ func main() {
 				timervalue = value
 			case "url":
 				url = cmd[1]
+			case "query":
+				queryStr := strings.SplitN(text, " ", 2)
+				rows, err := db.Query(queryStr[1])
+				if err != nil {
+					log.Fatal(err)
+				}
+				dumpTable(rows, os.Stdout)
 			case "stop":
 				worker <- "stop message"
 			}
