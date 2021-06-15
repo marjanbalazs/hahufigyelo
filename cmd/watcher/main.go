@@ -47,18 +47,45 @@ type DB struct {
 }
 
 func (db *DB) insertCar(car *Car) {
-	stmt, err := db.db.Prepare(`INSERT INTO cars VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	queryResult, err := db.db.Query(`SELECT * FROM cars WHERE id=?`, car.id)
 	if err != nil {
-		log.Fatal("Preparing INSERT statement failed")
+		fmt.Println(err)
+		fmt.Println(car)
+		fmt.Println("Preparing SELECT statement failed")
 	}
-	_, err = stmt.Exec(car.id, car.name, car.price, car.engine, car.year, car.month, car.enginesize, car.powerKW, car.powerHP, car.kilometers)
-	if err != nil {
-		log.Fatal("Failed to INSERT")
+	if !queryResult.Next() {
+		stmt, err := db.db.Prepare(`INSERT INTO cars VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			fmt.Println("Preparing INSERT statement failed")
+		}
+		_, err = stmt.Exec(car.id, car.name, car.price, car.engine, car.year, car.month, car.enginesize, car.powerKW, car.powerHP, car.kilometers)
+		if err != nil {
+			fmt.Println("Failed to INSERT")
+			fmt.Println(car)
+		}
+	} else {
+		queryResult.Close()
+		_, err := db.db.Exec(`UPDATE cars SET name=?, price=?, engine=?, year=?, month=?, enginesize=?, powerKW=?, powerHP=?, kilometers=? WHERE id=?`,
+			car.name,
+			car.price,
+			car.engine,
+			car.year,
+			car.month,
+			car.enginesize,
+			car.powerKW,
+			car.powerHP,
+			car.kilometers,
+			car.id)
+		if err != nil {
+			fmt.Println("Failed to UPDATE")
+			fmt.Print(err)
+			fmt.Println(car)
+		}
 	}
 }
 
 func (db *DB) createCarTable() {
-	stmt, err := db.db.Prepare(`CREATE TABLE IF NOT EXISTS cars(
+	stmt, err := db.db.Prepare(`CREATE TABLE IF NOT EXISTS cars (
 		id INTEGER PRIMARY KEY,
 		name TEXT,
 		price INTEGER,
@@ -108,7 +135,6 @@ func refreshList(url string, site io.ReadCloser, jobSubmitter chan<- string) {
 			return 1
 		}
 		lastElemNum := paginationItem.Find(".last").First().Text()
-		fmt.Println(lastElemNum)
 		value, err := strconv.Atoi(lastElemNum)
 		if err != nil {
 			return 1
@@ -147,18 +173,17 @@ func processSite(htmlBody io.ReadCloser, db *DB) {
 			price := selection.Find(".vetelar").Last().Text()
 			value, err := extractNumberFromString(price)
 			if err != nil {
-				fmt.Println("Couldn't parse price")
 				return
 			}
 			car.price = value
 
 			infos := selection.Find(".talalatisor-info").Filter(".adatok")
-			var infoStrings []string
-			infos.Each(func(i int, s *goquery.Selection) {
-				stuff := s.Find("SPAN").Text()
-				infoStrings = append(infoStrings, stuff)
-			})
 
+			var infoString string
+			infos.Each(func(i int, s *goquery.Selection) {
+				infoString = s.Find("SPAN").Text()
+			})
+			infoStrings := strings.Split(infoString, ",")
 			for idx, str := range infoStrings {
 				trimmed := strings.TrimSpace(str)
 				switch DetailOrder(idx) {
@@ -215,7 +240,6 @@ func worker(jobs <-chan string, db *DB) {
 		select {
 		case job := <-jobs:
 			<-rateLimiter
-			fmt.Println(job)
 			site := getSite(job)
 			processSite(site, db)
 		}
